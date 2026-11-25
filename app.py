@@ -1,4 +1,5 @@
 import base64
+import binascii
 import json
 import re
 import sqlite3
@@ -15,22 +16,33 @@ CORS(app)
 DB_PATH = "link_cache.db"
 CACHE_TTL_SECONDS = 86400
 MAX_LINKS_PER_REQUEST = 15
-MAX_REDIRECT_HOPS = 6
-REQUEST_TIMEOUT_SECONDS = 8
+MAX_REDIRECT_HOPS = 10
+REQUEST_TIMEOUT_SECONDS = 9
 
 PARAM_KEYS = [
     "url", "target", "dest", "destination", "redirect",
-    "redirect_url", "return_url", "next", "u", "to",
-    "link", "r", "q", "data", "href", "go", "out", "uri"
+    "redirect_url", "return", "return_url", "next", "u", "to",
+    "link", "r", "q", "data", "href", "go", "out", "uri", "callback",
+    "continue", "forward", "ref", "site", "endpoint", "step", "location"
 ]
 
 BROWSER_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        "Mozilla/5.0 (Linux; Android 13; SM-G998B) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/125.0.0.0 Mobile Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
+}
+
+BLOCKED_HOSTS = {
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "::1",
+    "serverwebsite-3wvl.onrender.com",
 }
 
 
@@ -88,6 +100,21 @@ def save_cached_link(source_url: str, resolved_url: str) -> None:
         pass
 
 
+def is_valid_http_url(url: str) -> bool:
+    try:
+        if not url or len(url) > 4096:
+            return False
+        parsed = urlparse(url.strip())
+        host = (parsed.hostname or "").strip().lower()
+        if parsed.scheme not in ("http", "https") or not host:
+            return False
+        if host in BLOCKED_HOSTS or "." not in host:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def normalize_input_url(raw_value: str):
     candidate = str(raw_value or "").strip()
     if not candidate or len(candidate) > 4096:
@@ -97,24 +124,24 @@ def normalize_input_url(raw_value: str):
     return candidate if is_valid_http_url(candidate) else None
 
 
-def is_valid_http_url(url: str) -> bool:
+def try_decode_hex(token: str):
+    cleaned = str(token or "").strip()
+    if len(cleaned) < 16 or len(cleaned) > 4096 or len(cleaned) % 2 != 0:
+        return None
+    if not re.fullmatch(r"[0-9a-fA-F]+", cleaned):
+        return None
     try:
-        if not url or len(url) > 4096:
-            return False
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").strip().lower()
-        if parsed.scheme not in ("http", "https") or not host:
-            return False
-        if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-            return False
-        return "." in host
+        decoded = binascii.unhexlify(cleaned).decode("utf-8", errors="ignore").strip()
+        if is_valid_http_url(decoded):
+            return decoded
     except Exception:
-        return False
+        return None
+    return None
 
 
 def try_decode_base64(token: str):
     cleaned = str(token or "").strip()
-    if not cleaned or len(cleaned) > 2048:
+    if not cleaned or len(cleaned) < 8 or len(cleaned) > 4096:
         return None
     if not re.fullmatch(r"[A-Za-z0-9+/_-]+={0,2}", cleaned):
         return None
@@ -141,7 +168,7 @@ def find_url_in_object(obj):
         val = obj.strip()
         if is_valid_http_url(val):
             return val
-        return try_decode_base64(val)
+        return try_decode_base64(val) or try_decode_hex(val)
     if isinstance(obj, dict):
         for k, v in obj.items():
             if str(k).lower() in PARAM_KEYS:
@@ -160,52 +187,108 @@ def find_url_in_object(obj):
     return None
 
 
-def extract_embedded_target(url: str) -> str:
-    current = url
-    try:
-        for _ in range(4):
-            parsed = urlparse(current)
-            qs = parse_qs(parsed.query, keep_blank_values=False)
-            found = None
+def extract_from_string_blob(blob: str, base_url: str = ""):
+    if not blob:
+        return None
 
+    direct_matches = re.findall(r'https?://[^\s"\'<>\\)\]}]+', blob)
+    for raw_match in direct_matches:
+        cleaned = raw_match.rstrip(".,;:")
+        if is_valid_http_url(cleaned):
+            return cleaned
+
+    for token in re.findall(r"[A-Za-z0-9+/_=-]{12,1024}", blob):
+        b64 = try_decode_base64(token)
+        if b64:
+            return b64
+        hx = try_decode_hex(token)
+        if hx:
+            return hx
+
+    if base_url:
+        rel_matches = re.findall(r'["\'](/[^"\'\s<>]{2,512})["\']', blob)
+        for rel in rel_matches:
+            if any(k in rel.lower() for k in ("redirect", "target", "dest", "next", "goto", "go", "out", "key", "auth", "step")):
+                full_rel = urljoin(base_url, rel)
+                if is_valid_http_url(full_rel):
+                    return full_rel
+
+    return None
+
+
+def extract_embedded_target(url: str):
+    current = url
+    reason = "direct"
+    try:
+        for _ in range(6):
+            parsed = urlparse(current)
+            found = None
+            found_reason = None
+
+            combined_parts = []
+            qs = parse_qs(parsed.query, keep_blank_values=False)
             for key in PARAM_KEYS:
                 if key in qs and qs[key]:
-                    val = unquote(qs[key][0]).strip()
-                    if is_valid_http_url(val):
-                        found = val
-                        break
-                    decoded_val = try_decode_base64(val)
-                    if decoded_val:
-                        found = decoded_val
-                        break
+                    for v in qs[key]:
+                        combined_parts.append((unquote(v).strip(), "query_param"))
 
-            if not found:
-                for seg in parsed.path.split("/"):
-                    seg_dec = unquote(seg).strip()
-                    if not seg_dec:
-                        continue
-                    if is_valid_http_url(seg_dec):
-                        found = seg_dec
+            for _, vals in qs.items():
+                for v in vals:
+                    combined_parts.append((unquote(v).strip(), "query_value"))
+
+            if parsed.fragment:
+                combined_parts.append((unquote(parsed.fragment).strip(), "fragment"))
+                frag_qs = parse_qs(parsed.fragment, keep_blank_values=False)
+                for key in PARAM_KEYS:
+                    if key in frag_qs and frag_qs[key]:
+                        combined_parts.append((unquote(frag_qs[key][0]).strip(), "fragment_param"))
+
+            for seg in parsed.path.split("/"):
+                seg_dec = unquote(seg).strip()
+                if seg_dec:
+                    combined_parts.append((seg_dec, "path_segment"))
+
+            for part, src_kind in combined_parts:
+                if is_valid_http_url(part):
+                    found = part
+                    found_reason = src_kind
+                    break
+                if part.startswith("//"):
+                    proto_url = "https:" + part
+                    if is_valid_http_url(proto_url):
+                        found = proto_url
+                        found_reason = f"{src_kind}_proto"
                         break
-                    if 8 <= len(seg_dec) <= 1024:
-                        decoded_seg = try_decode_base64(seg_dec)
-                        if decoded_seg:
-                            found = decoded_seg
-                            break
+                decoded_b64 = try_decode_base64(part)
+                if decoded_b64:
+                    found = decoded_b64
+                    found_reason = f"{src_kind}_base64"
+                    break
+                decoded_hex = try_decode_hex(part)
+                if decoded_hex:
+                    found = decoded_hex
+                    found_reason = f"{src_kind}_hex"
+                    break
+                blob_url = extract_from_string_blob(part, current)
+                if blob_url:
+                    found = blob_url
+                    found_reason = f"{src_kind}_blob"
+                    break
 
             if found and found != current and is_valid_http_url(found):
                 current = found
+                reason = found_reason or "extracted"
             else:
                 break
     except Exception:
-        return current
-    return current
+        return current, reason
+    return current, reason
 
 
-def extract_html_redirect(base_url: str, html_text: str):
+def extract_html_or_js_target(base_url: str, html_text: str):
     if not html_text:
-        return None
-    snippet = html_text[:65536]
+        return None, None
+    snippet = html_text[:131072]
 
     meta_match = re.search(
         r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\']?[^"\']*url\s*=\s*([^"\'>\s;]+)',
@@ -215,84 +298,119 @@ def extract_html_redirect(base_url: str, html_text: str):
     if meta_match:
         candidate = urljoin(base_url, unquote(meta_match.group(1).strip()))
         if is_valid_http_url(candidate):
-            return candidate
+            return candidate, "meta_refresh"
 
-    js_match = re.search(
-        r'(?:window\.location(?:\.href)?|location\.href|location\.replace)\s*=\s*["\']([^"\']+)["\']',
-        snippet,
-        re.IGNORECASE,
-    )
-    if js_match:
-        candidate = urljoin(base_url, unquote(js_match.group(1).strip()))
-        if is_valid_http_url(candidate):
-            return candidate
+    js_patterns = [
+        r'(?:window\.location(?:\.href)?|location\.href|location\.replace|location\.assign)\s*=\s*["\']([^"\']+)["\']',
+        r'(?:location\.replace|location\.assign|window\.open)\(\s*["\']([^"\']+)["\']',
+        r'(?:redirectUrl|targetUrl|destinationUrl|nextUrl|redirect_url|target_url|next_step)\s*[:=]\s*["\']([^"\']+)["\']',
+    ]
+    for pattern in js_patterns:
+        match = re.search(pattern, snippet, re.IGNORECASE)
+        if match:
+            raw_target = unquote(match.group(1).strip())
+            b64_inside = try_decode_base64(raw_target)
+            if b64_inside:
+                return b64_inside, "js_base64"
+            candidate = urljoin(base_url, raw_target)
+            if is_valid_http_url(candidate):
+                return candidate, "js_redirect"
 
-    return None
+    return None, None
 
 
-def follow_server_redirects(url: str) -> str:
-    current = extract_embedded_target(url)
+def follow_server_redirects(url: str):
+    current, reason = extract_embedded_target(url)
+    visited = {current}
     session = requests.Session()
     session.headers.update(BROWSER_HEADERS)
 
     try:
         for _ in range(MAX_REDIRECT_HOPS):
-            current = extract_embedded_target(current)
+            current, emb_reason = extract_embedded_target(current)
+            if emb_reason != "direct":
+                reason = emb_reason
+
+            step_headers = {"Referer": current}
             resp = session.get(
                 current,
+                headers=step_headers,
                 allow_redirects=True,
                 timeout=REQUEST_TIMEOUT_SECONDS,
                 stream=True,
             )
+
+            if resp.history:
+                reason = "http_redirect"
+
             final_url = resp.url if is_valid_http_url(resp.url) else current
-            final_url = extract_embedded_target(final_url)
+            final_url, post_reason = extract_embedded_target(final_url)
+            if post_reason != "direct":
+                reason = post_reason
 
             content_type = resp.headers.get("Content-Type", "").lower()
             next_url = None
-            if "text/html" in content_type or "application/xhtml" in content_type:
-                raw_html = resp.content[:65536].decode(resp.encoding or "utf-8", errors="ignore")
-                next_url = extract_html_redirect(final_url, raw_html)
+            next_reason = None
+
+            if "text/html" in content_type or "application/xhtml" in content_type or "application/json" in content_type:
+                body_text = resp.content[:131072].decode(resp.encoding or "utf-8", errors="ignore")
+                if "application/json" in content_type or body_text.lstrip().startswith(("{", "[")):
+                    try:
+                        parsed_json = json.loads(body_text)
+                        next_url = find_url_in_object(parsed_json)
+                        if next_url:
+                            next_reason = "json_target"
+                    except Exception:
+                        next_url, next_reason = extract_html_or_js_target(final_url, body_text)
+                else:
+                    next_url, next_reason = extract_html_or_js_target(final_url, body_text)
 
             resp.close()
 
-            if next_url and is_valid_http_url(next_url) and next_url != final_url:
+            if next_url and is_valid_http_url(next_url) and next_url not in visited:
+                visited.add(next_url)
                 current = next_url
+                reason = next_reason or "chained"
             else:
                 current = final_url
                 break
     except Exception:
-        return extract_embedded_target(current)
+        fallback_url, fallback_reason = extract_embedded_target(current)
+        return fallback_url, (fallback_reason if fallback_reason != "direct" else "fallback")
     finally:
         try:
             session.close()
         except Exception:
             pass
 
-    return current
+    return current, reason
 
 
 def process_single_link(raw_link: str) -> dict:
     clean_url = normalize_input_url(raw_link)
     if not clean_url:
         fallback = str(raw_link or "").strip()
-        return {"resolvedUrl": fallback, "cached": False}
+        return {"resolvedUrl": fallback, "cached": False, "reason": "invalid_input"}
 
     cached = get_cached_link(clean_url)
     if cached:
-        return {"resolvedUrl": cached, "cached": True}
+        return {"resolvedUrl": cached, "cached": True, "reason": "cache_hit"}
 
-    resolved = follow_server_redirects(clean_url)
+    resolved, reason = follow_server_redirects(clean_url)
     if not is_valid_http_url(resolved):
         resolved = clean_url
+        reason = "unchanged"
+    elif resolved == clean_url and reason == "direct":
+        reason = "unchanged"
 
     save_cached_link(clean_url, resolved)
-    return {"resolvedUrl": resolved, "cached": False}
+    return {"resolvedUrl": resolved, "cached": False, "reason": reason}
 
 
 @app.route("/", methods=["GET"])
 def index_route():
     return jsonify({
-        "service": "Delta Link Resolver API",
+        "service": "Delta Link Resolver Engine",
         "status": "online",
         "endpoints": ["/health", "/resolve"]
     })
@@ -329,4 +447,4 @@ def resolve_links_route():
 if __name__ == "__main__":
     init_db()
     app.run(host="0.0.0.0", port=5000)
-                    
+                
